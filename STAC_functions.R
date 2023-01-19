@@ -3,7 +3,7 @@
 ##  Author: Jasper Van doninck
 ##
 
-sign_backup <- function(item, collection, pcKey=''){
+sign_backup <- function(item, pcKey=''){
   #   Sign STACItemCollection 
   #
   #   Description
@@ -11,11 +11,10 @@ sign_backup <- function(item, collection, pcKey=''){
   #     Can be used if the functions 'items_sign' and 'sign_planetary_computer' from the 'rstac' package throw an error
   #
   #   Usage
-  #     sign_backup(item, collectionm pcKey=NULL)
+  #     sign_backup(item, collection, pcKey=NULL)
   #
   #   Arguments
   #     item        a STACItemCollection object representing the results of /stac/search
-  #     collection  a character representing collection id (function should be updated so that this argument is detected automatically)
   #     pcKey       a character representing a personal Planetary Computer key. Not required
   #
   #   Value
@@ -23,6 +22,11 @@ sign_backup <- function(item, collection, pcKey=''){
 
   library(httr)
   
+  collection <- sapply(item$features, function(x){x$collection}) %>%
+    as.factor() %>%
+    levels()
+  if(length(collection)>1) stop('Multiple collection IDs in item')
+
   if(nchar(pcKey)==0) {
     tok_ret <- httr::GET(paste0('https://planetarycomputer.microsoft.com/api/sas/v1/token/', collection)) %>%         
       httr::content() 
@@ -75,6 +79,7 @@ assets2rast <- function(feature, assets, as.list=FALSE){
   #   Value
   #     a spatRaster object
 
+  library(httr)
   library(terra)
   fAssets <- feature$assets[which(names(feature$assets) %in% assets)]
   fURLs <- lapply(fAssets, function(x){paste0('/vsicurl/',x$href)})
@@ -84,10 +89,11 @@ assets2rast <- function(feature, assets, as.list=FALSE){
 }
 
 cropFromSTAC <- function(feature, 
-                         assets=NULL,
                          bbox=feature$bbox, 
+                         assets=NULL,
                          collection=feature$collection,
-                         commonRes="low"){
+                         commonRes="low",
+                         extend=FALSE){
   #   Crop raster from STAC feature
   #
   #   Description
@@ -109,13 +115,14 @@ cropFromSTAC <- function(feature,
   #   Value
   #     a spatRaster object
   
+  library(terra)
   
   ##  Set default assets for Landsat/Sentinel-2, if not provided as arguments
   if(is.null(assets)){
     if(collection=='landsat-c2-l2'){
       assets <- c("blue" , "green", "red", "nir08", "swir16", "swir22")
     } else if(collection=='sentinel-2-l2a'){
-      assets <- c(c("B02", "B03", "B04", "B08"), c("B05", "B06", "B07", "B8A", "B11", "B12"))
+      assets <- c("B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12")
     } else {
       stop("Only default assets for Landsat/Sentinel-2 implemented")
     }
@@ -133,15 +140,15 @@ cropFromSTAC <- function(feature,
   if(length(resLevels)==1){
     #Simple case in which all assets have same resolution
     featBands <- rast(featBands) %>%
-      crop(cropExt)
+      crop(cropExt, extend=extend)
   } else {
     #split bands in list by resolution and crop
-    featBands <- lapply(resLevels, function(r) rast(featBands[resolutions==r]) %>% crop(cropExt, snap="in"))
+    featBands <- lapply(resLevels, function(r) rast(featBands[resolutions==r]) %>% crop(cropExt, snap="in", extend=extend))
     
     #crop all resolutions to extent of lowest spatial resolution to make sure they allign
     #TODO: Should search for a better way to do this by first defining the commom extent, then cropping
     commonExt <- ext(featBands[[which.max(resLevels)]])
-    featBands <- lapply(featBands, crop, commonExt)
+    featBands <- lapply(featBands, crop, commonExt, extend=extend)
     
     if(commonRes=="low"){
       suppressWarnings( #will give a warning for resolution where aggregation is not necessary
@@ -166,13 +173,13 @@ cropFromSTAC <- function(feature,
       sapply(nums, function(x){as.integer(intToBits(x)[1:nBits])})
     }
     metaBits <- assets2rast(feature, "qa_pixel") %>%
-      crop(cropExt) %>%
+      crop(cropExt, extend=extend) %>%
       app(numToBinary, nBits=8)
     featBands <- terra::mask(featBands, app(terra::subset(metaBits, 7, negate=TRUE), sum)==0, maskvalues=FALSE, updatevalue=NA)
   } else if(collection=='sentinel-2-l2a'){
     #Apply mask based on "scene classification map" layer
     SCL <- assets2rast(feature, "SCL") %>%
-      crop(commonExt)
+      crop(commonExt, extend=extend)
     if(res(SCL)[1] > res(featBands)[1]) SCL <- disagg(SCL, fact=res(SCL)[1]/res(featBands)[1], method="near")
     SCL <- classify(SCL, matrix(data=c(
       0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
@@ -182,6 +189,9 @@ cropFromSTAC <- function(feature,
   
   ##  Attach time to output spatRast
   time(featBands) <- rep(as.POSIXlt(feature$properties$datetime, format="%Y-%m-%dT%H:%M:%S", tz="GMT"), nlyr(featBands))
+  
+  ##  Re-order layers to order of input assets
+  featBands <- featBands[[assets]]
   
   return(featBands)
 }
