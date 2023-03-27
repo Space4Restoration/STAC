@@ -77,7 +77,7 @@ assets2rast <- function(feature, assets, as.list=FALSE){
   #     Set 'as.list=TRUE' to deal with assets with different extents or dimensions
   #
   #   Value
-  #     a spatRaster object
+  #     a (list of) spatRaster object(s)
 
   library(httr)
   library(terra)
@@ -88,114 +88,260 @@ assets2rast <- function(feature, assets, as.list=FALSE){
   return(ras)
 }
 
-cropFromSTAC <- function(feature, 
-                         bbox=feature$bbox, 
-                         assets=NULL,
-                         collection=feature$collection,
-                         commonRes="low",
-                         extend=FALSE){
-  #   Crop raster from STAC feature
+
+cropSTACFeature <- function(feature, 
+                            assets,
+                            bbox,
+                            extend=TRUE,
+                            as.list=FALSE,
+                            commonRes="high"){
+
+  #   Crop spatRraster from STAC feature
   #
   #   Description
   #    Extract spatial subset (crop) from a STAC feature assets
   #
   #   Usage
-  #     cropFromSTAC(feature, assets=NULL, bbox, collection, commonRes="low")
+  #     cropSTACFeature(feature, assets=NULL, bbox, collection, commonRes="low")
   #
   #   Arguments
   #     feature     a STAC feature: list element of STACItemCollection$features
   #     assets      character vector of assets names to extract
   #     bbox        numeric vector representing bounding box (xmin, ymin, xmax, ymax) in geographic coordinates
-  #     collection  character
   #     commonRes   character. If assets have multiple resolutions: "low" aggregating to coarsest resolution, "high" for disaggregating to finest resolution 
-  #   
+  #     extend      boolean. Should the cropped area be extended if the bounding box goes beyond the STAC asset's geometry    
+  #     mask
+  #
   #   Details
-  #     
+  #     Warning! If spatial resolutions of assets are not all multiples of each others, returning as multilayer spatRaster will result in error
   #
   #   Value
   #     a spatRaster object
+  #
+  #   To do
+  #     add error/warning if no valid assets selected
+  #     add ... additional arguments for crop?
+  #
   
   library(terra)
-  
-  ##  Set default assets for Landsat/Sentinel-2, if not provided as arguments
-  if(is.null(assets)){
-    if(collection=='landsat-c2-l2'){
-      assets <- c("blue" , "green", "red", "nir08", "swir16", "swir22")
-    } else if(collection=='sentinel-2-l2a'){
-      assets <- c("B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12")
-    } else {
-      stop("Only default assets for Landsat/Sentinel-2 implemented")
-    }
+  terraOptions(progress=0)
+
+  ##  Check input parameters, define default values
+    # feature
+  if(missing(feature)) stop("feature must be provided")
+  if(class(feature)[1]!="list") stop("feature must be list of type Feature")
+  if(feature$type!="Feature") stop("feature must be list of type Feature")
+    #assets
+    #If argument assets is missing, use all assets of type "image/tiff; application=geotiff; profile=cloud-optimized"
+  if(missing(assets)){
+    warning("assets not provided, all available assets selected")
+    assets <- names(feature$assets)[lapply(feature$assets, function(x) x$type)=="image/tiff; application=geotiff; profile=cloud-optimized"]
   }
+    #bbox
+  if(missing(bbox)) bbox <- feature$bbox
+  if(class(bbox)=="SpatExtent") bbox <- bbox[c(1,3,2,4)]  #Check if bbox is already a SpatExtent object
+
+  ##  Read assets as spatRaster object
+  featBands <- assets2rast(feature, assets, TRUE)
   
   ##  Reproject bounding box to crs of feature
   featCRS <- crs(paste0('EPSG:',feature$properties$`proj:epsg`))
   cropExt <- terra::project(ext(bbox, xy=TRUE), crs("+proj=longlat +datum=WGS84"), featCRS)
-  
-  ##  Read assets as spatRaster object - crop - harmonize resolutions (agg/disagg) if required 
-  featBands <- assets2rast(feature, assets, TRUE)
-  resolutions <- sapply(featBands, function(x) res(x)[1])
-  resLevels <- as.numeric(levels(as.factor(resolutions)))
-  
-  if(length(resLevels)==1){
-    #Simple case in which all assets have same resolution
-    featBands <- rast(featBands) %>%
-      crop(cropExt, extend=extend)
-  } else {
-    #split bands in list by resolution and crop
-    featBands <- lapply(resLevels, function(r) rast(featBands[resolutions==r]) %>% crop(cropExt, snap="in", extend=extend))
-    
-    #crop all resolutions to extent of lowest spatial resolution to make sure they allign
-    #TODO: Should search for a better way to do this by first defining the commom extent, then cropping
-    commonExt <- ext(featBands[[which.max(resLevels)]])
-    featBands <- lapply(featBands, crop, commonExt, extend=extend)
-    
-    if(commonRes=="low"){
-      suppressWarnings( #will give a warning for resolution where aggregation is not necessary
-        featBands <- lapply(featBands, function(x) aggregate(x, fact=max(resLevels)/res(x)[1], fun="mean")) %>%
-          rast()
-      )        
-    } else if (commonRes=="high") {
-      suppressWarnings(
-        featBands <- lapply(featBands, function(x) disagg(x, fact=res(x)[1]/min(resLevels), method="near")) %>%
-          rast()
-      )
-    } else {
-      stop('Argument "commonRes" must be either "low" or "high"')
-    }
-  } 
-  
-  ##  Apply mask
-  #add if() with argument to make this optional?
-  if(collection=='landsat-c2-l2'){
-    #Apply mask based on Landsat 'pa_pixel' bits
-    numToBinary <- function(nums, nBits){
-      sapply(nums, function(x){as.integer(intToBits(x)[1:nBits])})
-    }
-    metaBits <- assets2rast(feature, "qa_pixel") %>%
-      crop(cropExt, extend=extend) %>%
-      app(numToBinary, nBits=8)
-    featBands <- terra::mask(featBands, app(terra::subset(metaBits, 7, negate=TRUE), sum)==0, maskvalues=FALSE, updatevalue=NA)
-  } else if(collection=='sentinel-2-l2a'){
-    #Apply mask based on "scene classification map" layer
-    SCL <- assets2rast(feature, "SCL") %>%
-      crop(commonExt, extend=extend)
-    if(res(SCL)[1] > res(featBands)[1]) SCL <- disagg(SCL, fact=res(SCL)[1]/res(featBands)[1], method="near")
-    SCL <- classify(SCL, matrix(data=c(
-      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-      0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0,  0), ncol=2))
-    featBands <- terra::mask(featBands, SCL, maskvalues=0, updatevalue=NA)
+
+  ##  Adjust crop extent to match asset with coarsest resolution
+  coarseRast <- sapply(featBands, function(x) res(x)[1]) %>% 
+    which.max()
+  cropExt <- align(cropExt, featBands[[coarseRast]], snap="out")
+
+  ##  Crop assets
+  cropFun <- function(b, cropExt, extend){
+    cr <- crop(b,cropExt, snap="near")
+    if(isTRUE(extend)) cr <- extend(cr, cropExt) #Crop with extend=TRUE seems to be broken, so adding this line
+    time(cr) <- rep(as.POSIXlt(feature$properties$datetime, format="%Y-%m-%dT%H:%M:%S", tz="GMT"), nlyr(cr))
+    return(cr)
   }
+  croppedBands <- lapply(featBands, cropFun, cropExt, extend)
   
-  ##  Attach time to output spatRast
-  time(featBands) <- rep(as.POSIXlt(feature$properties$datetime, format="%Y-%m-%dT%H:%M:%S", tz="GMT"), nlyr(featBands))
-  
-  ##  Re-order layers to order of input assets
-  featBands <- featBands[[assets]]
-  
-  return(featBands)
+  if(!isTRUE(as.list)){
+    # Check spatial resolutions of assets
+    resolutions <- sapply(featBands, function(x) res(x)[1])
+    resLevels <- as.numeric(levels(as.factor(resolutions)))
+    if(length(resLevels)>1){
+      #Assets with different resolution: harmonize assets to common resolution (assuming multiples)
+      # Target resolution: either specified or highest/lowest
+      if(is.numeric(commonRes)){
+        targetRes <- commonRes
+      } else {
+        targetRes <- switch(commonRes,
+                            low=max(resLevels),
+                            high=min(resLevels))
+      }
+      fun <- function(x){
+        if(res(x)[1]==targetRes){
+          return(x)
+        } else if(res(x)[1]>targetRes){
+          #disaggregate
+          return(disagg(x, fact=res(x)[1]/targetRes, method="near"))
+        } else if(res(x)[1]<targetRes){
+          #aggregate
+          return(aggregate(x, fact=targetRes/res(x)[1], fun="mean"))
+        }
+      }
+      croppedBands <- lapply(croppedBands, fun)
+    }
+    croppedBands <- rast(croppedBands)
+  }
+  return(croppedBands)
 }
 
+cropSTACFeatureCollection <- function(FeatureCollection,
+                                      assets,
+                                      bbox,
+                                      extend=TRUE,
+                                      as.list=FALSE,
+                                      commonRes="high",
+                                      progress=TRUE){
+  # Read STAC Feature Collection
+  #
+  # Description
+  #   Read STAC FeatureCollection as list STAC features
+  #
+  # Arguments
+  #   stacFeatures    list. STAC FeatureCollection
+  #   ...             additional arguments passed to cropSTACFeature (assets, bbox, extend, as.list, commonRes)
+  #
+  # Value
+  #   list of spatRaster objects
+  #
   
+  library(terra)
+  library(httr)
+  
+  ##  Check input parameters
+  if(missing(FeatureCollection)) stop("FeatureCollection must be provided")
+  if(!"list" %in% class(FeatureCollection)) stop("FeatureCollection must be list of type FeatureCollection")
+  if(FeatureCollection$type!="FeatureCollection") stop("feature must be list of type FeatureCollection")
+  
+  nFeat <- length(FeatureCollection$features)
+  rastFeatures <- vector(mode='list', length=nFeat)
+  if(progress) pb <- txtProgressBar(min = 0,      # Minimum value of the progress bar
+                                    max = nFeat,  # Maximum value of the progress bar
+                                    style = 3,    # Progress bar style (also available style = 1 and style = 2)
+                                    width = 50,   # Progress bar width. Defaults to getOption("width")
+                                    char = "=")   # Character used to create the bar
+  for(f in 1:nFeat){  # ITeratively get the features
+    rastFeatures[[f]] <- tryCatch(cropSTACFeature(FeatureCollection$features[[f]],
+                                                  assets, bbox, extend, as.list, commonRes), 
+                                  error=function(e) NULL)
+    if(progress) setTxtProgressBar(pb, f)
+  }
+  if(progress) close(pb)
+  failed <- sapply(rastFeatures, is.null) #check for failed downloads
+  if(sum(failed) > 0) {                   #remove from list
+    warning(paste0(sum(failed)," failed download(s), feature(s) ignored"))
+    rastFeatures <- rastFeatures[!failed]
+  }
+  return(rastFeatures)
+}
 
+
+
+
+
+
+
+
+####  Specific functions (only Landsat/Sentinel-2 implemented)
+##  > unrelated to STAC, move to different place
+
+default_assets <- function(feature, collection, withMeta=TRUE){
+  #   Default assets for L/S2
   
+  if(missing(collection)) collection <- feature$collection
+  if(collection=='landsat-c2-l2'){
+    assets <- c("blue" , "green", "red", "nir08", "swir16", "swir22")
+    if(withMeta) assets <- c(assets,"qa_pixel")
+  } else if(collection=='sentinel-2-l2a'){
+    assets <- c("B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12")
+    if(withMeta) assets <- c(assets, "SCL")
+  } else {
+    stop("Only default assets for landsat-c2-l2/sentinel-2-l2a implemented")
+    assets <- NULL
+  }
+  return(assets)
+}
+
+
+meta2mask <- function(meta,
+                      collection,
+                      whichBits){
+  #   Create mask from feature metadata
+  #
+  #   Description
+  #     Uses the Landsat/Sentinel-2 metadata layers to create a mask
+  #     
+  #
+  #   Arguments
+  #     meta        SpatRaster object: metadata layer
+  #     collection  Character: 'landsat-c2-l2' or 'sentinel-2-l2a'. If missing, assumed from name of meta
+  #     whichBits   integer to select which bits/LCclasses are used to mask. 
+  #                   For Landsat: Defaults to the first 8 bits except 7
+  #                   For Sentinel-2: Defaults to classes 0,1,2,3,8,9,10,11
+  #
+  #   Details
+  #     Predefined which metadata values are used as mask. flexibility could be added as argument
+  #
+  #
+  
+  require(terra)
+  #require(magrittr)
+  
+  if(missing(collection)){
+    collection <- switch(names(meta[1]),
+                         "Not implemented",
+                         qa_pixel="landsat-c2-l2",
+                         SCL="sentinel-2-l2a")
+  }
+  
+  if(collection=='landsat-c2-l2'){
+    #Apply mask based on Landsat 'pa_pixel' bits
+    # if(missing(whichBits)) whichBits <- seq(1:8)[-7]
+    # numToBinary <- function(nums, nBits){
+    #   sapply(nums, function(x){as.integer(intToBits(x)[1:nBits])})
+    # }
+    # metaBits <- assets2rast(feature, "qa_pixel")
+    # if(!is.null(extent)) metaBits <- crop(metaBits, extent, ...)
+    # metaBits <- app(metaBits, numToBinary, nBits=max(whichBits))
+    # outMask <- app(subset(metaBits, whichBits), sum) %>%
+    #   classify(matrix(data=c(0,1,0,1,Inf, NA), byrow=TRUE, ncol=3), right=FALSE)
+    
+  } else if(collection=='sentinel-2-l2a'){
+    #Apply mask based on "scene classification map" layer
+
+    classMatrix <- matrix(data=c(0:11, rep(0,12)), ncol=2)
+    if(missing(whichBits)) whichBits <- c(0:3, 8:11)
+    classMatrix[classMatrix[,1] %in% whichBits,2] <- NA
+    outMask <- classify(meta, classMatrix)
+  } else {
+    stop("Metadata-based masks only implemented for Landsat and Sentinel-2")
+  }
+  return(outMask)
+}
+
+
+maskScene <- function(r){
+  require(terra)
+  require(magrittr)
+  metaLyr <- which(names(r)=="SCL" | names(r)=="qa_pixel")
+  rOut <- subset(r, metaLyr, negate=TRUE) %>%
+    mask(meta2mask(subset(r,metaLyr)))
+  return(rOut)
+}
+
+
+
+
+
+
+
+
